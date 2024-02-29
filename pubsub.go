@@ -925,7 +925,7 @@ func (p *PubSub) announce(topic string, sub bool) {
 			go p.announceRetry(pid, topic, sub)
 			continue
 		}
-		p.tracer.SendRPC(out, pid)
+		p.tracer.SendRPC(out, pid, false)
 	}
 }
 
@@ -968,7 +968,7 @@ func (p *PubSub) doAnnounceRetry(pid peer.ID, topic string, sub bool) {
 		go p.announceRetry(pid, topic, sub)
 		return
 	}
-	p.tracer.SendRPC(out, pid)
+	p.tracer.SendRPC(out, pid, false)
 }
 
 // notifySubs sends a given message to all corresponding subscribers.

@@ -97,7 +97,7 @@ func (fs *FloodSubRouter) Publish(msg *Message) {
 			// Drop it. The peer is too slow.
 			continue
 		}
-		fs.tracer.SendRPC(out, pid)
+		fs.tracer.SendRPC(out, pid, false)
 	}
 }
 

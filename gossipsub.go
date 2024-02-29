@@ -1224,7 +1224,7 @@ func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bo
 		gs.doDropRPC(rpc, p, "queue full")
 		return
 	}
-	gs.tracer.SendRPC(rpc, p)
+	gs.tracer.SendRPC(rpc, p, urgent)
 }
 
 func fragmentRPC(rpc *RPC, limit int) ([]*RPC, error) {
