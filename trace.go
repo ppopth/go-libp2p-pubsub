@@ -51,7 +51,7 @@ type RawTracer interface {
 	// RecvRPC is invoked when an incoming RPC is received.
 	RecvRPC(rpc *RPC)
 	// SendRPC is invoked when a RPC is sent.
-	SendRPC(rpc *RPC, p peer.ID, urgent bool)
+	SendRPC(rpc *RPC, p peer.ID)
 	// DropRPC is invoked when an outbound RPC is dropped, typically because of a queue full.
 	DropRPC(rpc *RPC, p peer.ID)
 	// UndeliverableMessage is invoked when the consumer of Subscribe is not reading messages fast enough and
@@ -274,13 +274,13 @@ func (t *pubsubTracer) RecvRPC(rpc *RPC) {
 	t.tracer.Trace(evt)
 }
 
-func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID, urgent bool) {
+func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID) {
 	if t == nil {
 		return
 	}
 
 	for _, tr := range t.raw {
-		tr.SendRPC(rpc, p, urgent)
+		tr.SendRPC(rpc, p)
 	}
 
 	if t.tracer == nil {
@@ -295,7 +295,6 @@ func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID, urgent bool) {
 		SendRPC: &pb.TraceEvent_SendRPC{
 			SendTo: []byte(p),
 			Meta:   t.traceRPCMeta(rpc),
-			Urgent: &urgent,
 		},
 	}
 

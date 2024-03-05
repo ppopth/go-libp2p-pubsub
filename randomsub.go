@@ -157,7 +157,7 @@ func (rs *RandomSubRouter) Publish(msg *Message) {
 			rs.tracer.DropRPC(out, p)
 			continue
 		}
-		rs.tracer.SendRPC(out, p, false)
+		rs.tracer.SendRPC(out, p)
 	}
 }
 

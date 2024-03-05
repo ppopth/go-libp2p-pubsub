@@ -78,7 +78,6 @@ message TraceEvent {
   message SendRPC {
     optional bytes sendTo = 1;
     optional RPCMeta meta = 2;
-    optional bool urgent = 3;
   }
 
   message DropRPC {
