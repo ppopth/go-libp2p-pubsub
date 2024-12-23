@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -237,6 +238,7 @@ type GossipSubParams struct {
 
 // NewGossipSub returns a new PubSub object using the default GossipSubRouter as the router.
 func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
+	return nil, errors.New("dumperror")
 	rt := DefaultGossipSubRouter(h)
 	opts = append(opts, WithRawTracer(rt.tagTracer))
 	return NewGossipSubWithRouter(ctx, h, rt, opts...)
