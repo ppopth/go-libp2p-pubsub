@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 
 	logging "github.com/ipfs/go-log/v2"
+	logg "log"
 )
 
 // DefaultMaximumMessageSize is 1mb.
@@ -46,6 +48,7 @@ type ProtocolMatchFn = func(protocol.ID) func(protocol.ID) bool
 
 // PubSub is the implementation of the pubsub system.
 type PubSub struct {
+	log *logg.Logger
 	// atomic counter for seqnos
 	// NOTE: Must be declared at the top of the struct as we perform atomic
 	// operations on this field.
@@ -201,6 +204,7 @@ type PubSubRouter interface {
 	// Allows routers with internal scoring to vet peers before committing any processing resources
 	// to the message and implement an effective graylist and react to validation queue overload.
 	AcceptFrom(peer.ID) AcceptStatus
+	ReceiveMessage(*Message)
 	// PreValidation is invoked on messages in the RPC envelope right before pushing it to
 	// the validation pipeline
 	PreValidation([]*Message)
@@ -252,7 +256,12 @@ type Option func(*PubSub) error
 
 // NewPubSub returns a new PubSub management object.
 func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option) (*PubSub, error) {
+	f, err := os.OpenFile("/root/message.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
 	ps := &PubSub{
+		log:                   logg.New(f, "gossipsub: ", 0),
 		host:                  h,
 		ctx:                   ctx,
 		rt:                    rt,
@@ -297,6 +306,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		idGen:                 newMsgIdGenerator(),
 		counter:               uint64(time.Now().UnixNano()),
 	}
+	ps.log.Println("NewPubSub go-libp2p-pubsub")
 
 	for _, opt := range opts {
 		err := opt(ps)
@@ -1102,6 +1112,8 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			}
 
 			msg := &Message{pmsg, "", rpc.from, nil, false}
+			p.rt.ReceiveMessage(msg)
+
 			if p.shouldPush(msg) {
 				toPush = append(toPush, msg)
 			}

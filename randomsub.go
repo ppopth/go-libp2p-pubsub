@@ -95,6 +95,7 @@ func (rs *RandomSubRouter) AcceptFrom(peer.ID) AcceptStatus {
 }
 
 func (rs *RandomSubRouter) PreValidation([]*Message) {}
+func (rs *RandomSubRouter) ReceiveMessage(*Message)  {}
 
 func (rs *RandomSubRouter) HandleRPC(rpc *RPC) {}
 
