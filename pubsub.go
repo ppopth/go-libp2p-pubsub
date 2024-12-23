@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 
 	logging "github.com/ipfs/go-log/v2"
+	logg "log"
 )
 
 // DefaultMaximumMessageSize is 1mb.
@@ -46,6 +48,7 @@ type ProtocolMatchFn = func(protocol.ID) func(protocol.ID) bool
 
 // PubSub is the implementation of the pubsub system.
 type PubSub struct {
+	log *logg.Logger
 	// atomic counter for seqnos
 	// NOTE: Must be declared at the top of the struct as we perform atomic
 	// operations on this field.
@@ -252,7 +255,12 @@ type Option func(*PubSub) error
 
 // NewPubSub returns a new PubSub management object.
 func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option) (*PubSub, error) {
+	f, err := os.OpenFile("/root/message.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
 	ps := &PubSub{
+		log:                   logg.New(f, "gossipsub", 0),
 		host:                  h,
 		ctx:                   ctx,
 		rt:                    rt,
@@ -297,6 +305,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		idGen:                 newMsgIdGenerator(),
 		counter:               uint64(time.Now().UnixNano()),
 	}
+	ps.log.Println("NewPubSub go-libp2p-pubsub")
 
 	for _, opt := range opts {
 		err := opt(ps)
