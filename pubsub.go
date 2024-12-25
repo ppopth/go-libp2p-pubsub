@@ -1087,6 +1087,7 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				delete(tmap, rpc.from)
 				p.notifyLeave(t, rpc.from)
 			}
+			// TODO: RemovePeer
 		}
 	}
 

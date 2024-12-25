@@ -644,6 +644,11 @@ loop:
 func (gs *GossipSubRouter) RemovePeer(p peer.ID) {
 	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
 	gs.tracer.RemovePeer(p)
+	for topic, peers := range gs.p.topics {
+		if _, ok := peers[p]; ok {
+			gs.p.log.Printf("bug %s is still in topic %s", p, topic)
+		}
+	}
 	delete(gs.peers, p)
 	for _, peers := range gs.mesh {
 		delete(peers, p)
