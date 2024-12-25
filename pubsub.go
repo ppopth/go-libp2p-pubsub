@@ -586,6 +586,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 		case s := <-p.newPeerStream:
 			pid := s.Conn().RemotePeer()
+			p.log.Printf("newPeerStream %s", pid)
 
 			q, ok := p.peers[pid]
 			if !ok {
