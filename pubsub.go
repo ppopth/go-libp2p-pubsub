@@ -1072,6 +1072,14 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 
 			if _, ok = tmap[rpc.from]; !ok {
 				tmap[rpc.from] = struct{}{}
+				gs := p.rt.(*GossipSubRouter)
+				pss, ok := gs.peers[rpc.from]
+				if !ok {
+					p.log.Printf("not found %s in gs.peers", rpc.from)
+				}
+				if pss == "" {
+					p.log.Printf("found %s empty in gs.peers", rpc.from)
+				}
 				if topic, ok := p.myTopics[t]; ok {
 					peer := rpc.from
 					topic.sendNotification(PeerEvent{PeerJoin, peer})
