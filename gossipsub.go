@@ -1159,7 +1159,7 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 		for p := range tmap {
 			if !gs.feature(GossipSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.publishThreshold {
 				if gs.peers[p] == "" {
-					gs.p.log.Println("found bug")
+					gs.p.log.Printf("found bug %s", p)
 				}
 				tosend[p] = struct{}{}
 			}
