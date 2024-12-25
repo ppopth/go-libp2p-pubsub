@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"math/rand"
@@ -645,7 +646,10 @@ func (gs *GossipSubRouter) RemovePeer(p peer.ID) {
 	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
 	gs.tracer.RemovePeer(p)
 	delete(gs.peers, p)
-	for _, peers := range gs.mesh {
+	for topic, peers := range gs.mesh {
+		if _, ok := peers[p]; ok {
+			gs.p.log.Printf("%s: prune topic=%s pid=%s\n", time.Now(), topic, p)
+		}
 		delete(peers, p)
 	}
 	for _, peers := range gs.fanout {
@@ -720,12 +724,45 @@ func (gs *GossipSubRouter) PreValidation(msgs []*Message) {
 		for p := range gs.mesh[topic] {
 			// send to only peers that support IDONTWANT
 			if gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) {
-				idontwant := []*pb.ControlIDontWant{{MessageIDs: mids}}
-				out := rpcWithControl(nil, nil, nil, nil, nil, idontwant)
-				gs.sendRPC(p, out, true)
+				// idontwant := []*pb.ControlIDontWant{{MessageIDs: mids}}
+				// out := rpcWithControl(nil, nil, nil, nil, nil, idontwant)
+				// gs.sendRPC(p, out, true)
 			}
 		}
 	}
+}
+
+func (gs *GossipSubRouter) ReceiveMessage(msg *Message) {
+	topic := msg.GetTopic()
+	tmap, ok := gs.p.topics[topic]
+	if !ok {
+		return
+	}
+	pid := msg.ReceivedFrom
+
+	var peerType string
+	if _, ok := gs.direct[pid]; ok {
+		peerType = "direct"
+	} else if _, ok := gs.mesh[topic][pid]; ok {
+		peerType = "mesh"
+	} else if _, ok := tmap[pid]; ok {
+		peerType = "peer"
+	} else {
+		peerType = "outsider"
+	}
+
+	protoid, _ := gs.peers[pid]
+
+	var av string
+	raw, err := gs.p.host.Peerstore().Get(pid, "AgentVersion")
+	if err == nil {
+		av, _ = raw.(string)
+	}
+
+	mid := gs.p.idGen.ID(msg)
+	encodedMid := base64.StdEncoding.EncodeToString([]byte(mid))
+
+	gs.p.log.Printf("%s: receive topic=%s mid=%s pid=%s peerType=%s mesh=%d protoid=%s agentVersion=%s\n", time.Now(), topic, encodedMid, pid, peerType, len(gs.mesh[topic]), protoid, av)
 }
 
 func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
@@ -734,17 +771,17 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 		return
 	}
 
-	iwant := gs.handleIHave(rpc.from, ctl)
-	ihave := gs.handleIWant(rpc.from, ctl)
+	gs.handleIHave(rpc.from, ctl)
+	gs.handleIWant(rpc.from, ctl)
 	prune := gs.handleGraft(rpc.from, ctl)
 	gs.handlePrune(rpc.from, ctl)
 	gs.handleIDontWant(rpc.from, ctl)
 
-	if len(iwant) == 0 && len(ihave) == 0 && len(prune) == 0 {
+	if len(prune) == 0 {
 		return
 	}
 
-	out := rpcWithControl(ihave, nil, iwant, nil, prune, nil)
+	out := rpcWithControl(nil, nil, nil, nil, prune, nil)
 	gs.sendRPC(rpc.from, out, false)
 }
 
@@ -948,6 +985,9 @@ func (gs *GossipSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.
 
 		log.Debugf("GRAFT: add mesh link from %s in %s", p, topic)
 		gs.tracer.Graft(p, topic)
+		if _, ok := peers[p]; !ok {
+			gs.p.log.Printf("%s: graft topic=%s pid=%s\n", time.Now(), topic, p)
+		}
 		peers[p] = struct{}{}
 	}
 
@@ -974,6 +1014,9 @@ func (gs *GossipSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 		}
 
 		log.Debugf("PRUNE: Remove mesh link to %s in %s", p, topic)
+		if _, ok := peers[p]; ok {
+			gs.p.log.Printf("%s: prune topic=%s pid=%s\n", time.Now(), topic, p)
+		}
 		gs.tracer.Prune(p, topic)
 		delete(peers, p)
 		// is there a backoff specified by the peer? if so obey it.
@@ -1177,12 +1220,12 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 		}
 
 		for p := range gmap {
-			mid := gs.p.idGen.ID(msg)
+			// mid := gs.p.idGen.ID(msg)
 			// Check if it has already received an IDONTWANT for the message.
 			// If so, don't send it to the peer
-			if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok {
-				continue
-			}
+			// if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok {
+			// 	continue
+			// }
 			tosend[p] = struct{}{}
 		}
 	}
@@ -1232,6 +1275,9 @@ func (gs *GossipSubRouter) Join(topic string) {
 				gmap[p] = struct{}{}
 			}
 		}
+		for p, _ := range gmap {
+			gs.p.log.Printf("%s: graft topic=%s pid=%s\n", time.Now(), topic, p)
+		}
 		gs.mesh[topic] = gmap
 		delete(gs.fanout, topic)
 		delete(gs.lastpub, topic)
@@ -1243,6 +1289,9 @@ func (gs *GossipSubRouter) Join(topic string) {
 			_, doBackOff := backoff[p]
 			return !direct && !doBackOff && gs.score.Score(p) >= 0
 		})
+		for _, p := range peers {
+			gs.p.log.Printf("%s: graft topic=%s pid=%s\n", time.Now(), topic, p)
+		}
 		gmap = peerListToMap(peers)
 		gs.mesh[topic] = gmap
 	}
@@ -1262,6 +1311,9 @@ func (gs *GossipSubRouter) Leave(topic string) {
 
 	log.Debugf("LEAVE %s", topic)
 	gs.tracer.Leave(topic)
+	for p, _ := range gmap {
+		gs.p.log.Printf("%s: prune topic=%s pid=%s\n", time.Now(), topic, p)
+	}
 
 	delete(gs.mesh, topic)
 
@@ -1315,6 +1367,39 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) {
 	q, ok := gs.p.peers[p]
 	if !ok {
 		return
+	}
+
+	for _, pmsg := range out.GetPublish() {
+		topic := pmsg.GetTopic()
+		tmap, ok := gs.p.topics[topic]
+		if !ok {
+			return
+		}
+
+		var peerType string
+		if _, ok := gs.direct[p]; ok {
+			peerType = "direct"
+		} else if _, ok := gs.mesh[topic][p]; ok {
+			peerType = "mesh"
+		} else if _, ok := tmap[p]; ok {
+			peerType = "peer"
+		} else {
+			peerType = "outsider"
+		}
+
+		protoid, _ := gs.peers[p]
+
+		var av string
+		raw, err := gs.p.host.Peerstore().Get(p, "AgentVersion")
+		if err == nil {
+			av, _ = raw.(string)
+		}
+
+		msg := &Message{pmsg, "", "", nil, false}
+		mid := gs.p.idGen.ID(msg)
+		encodedMid := base64.StdEncoding.EncodeToString([]byte(mid))
+
+		gs.p.log.Printf("%s: send topic=%s mid=%s pid=%s peerType=%s mesh=%d protoid=%s agentVersion=%s\n", time.Now(), topic, encodedMid, p, peerType, len(gs.mesh[topic]), protoid, av)
 	}
 
 	// If we're below the max message size, go ahead and send
@@ -1564,6 +1649,9 @@ func (gs *GossipSubRouter) heartbeat() {
 	for topic, peers := range gs.mesh {
 		prunePeer := func(p peer.ID) {
 			gs.tracer.Prune(p, topic)
+			if _, ok := peers[p]; ok {
+				gs.p.log.Printf("%s: prune topic=%s pid=%s\n", time.Now(), topic, p)
+			}
 			delete(peers, p)
 			gs.addBackoff(p, topic, false)
 			topics := toprune[p]
@@ -1573,6 +1661,9 @@ func (gs *GossipSubRouter) heartbeat() {
 		graftPeer := func(p peer.ID) {
 			log.Debugf("HEARTBEAT: Add mesh link to %s in %s", p, topic)
 			gs.tracer.Graft(p, topic)
+			if _, ok := peers[p]; !ok {
+				gs.p.log.Printf("%s: graft topic=%s pid=%s\n", time.Now(), topic, p)
+			}
 			peers[p] = struct{}{}
 			topics := tograft[p]
 			tograft[p] = append(topics, topic)
@@ -1961,10 +2052,10 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 
 func (gs *GossipSubRouter) flush() {
 	// send gossip first, which will also piggyback pending control
-	for p, ihave := range gs.gossip {
+	for p, _ := range gs.gossip {
 		delete(gs.gossip, p)
-		out := rpcWithControl(nil, ihave, nil, nil, nil, nil)
-		gs.sendRPC(p, out, false)
+		// out := rpcWithControl(nil, ihave, nil, nil, nil, nil)
+		// gs.sendRPC(p, out, false)
 	}
 
 	// send the remaining control messages that wasn't merged with gossip
@@ -1988,7 +2079,7 @@ func (gs *GossipSubRouter) piggybackGossip(p peer.ID, out *RPC, ihave []*pb.Cont
 		out.Control = ctl
 	}
 
-	ctl.Ihave = ihave
+	// ctl.Ihave = ihave
 }
 
 func (gs *GossipSubRouter) pushControl(p peer.ID, ctl *pb.ControlMessage) {

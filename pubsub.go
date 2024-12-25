@@ -204,6 +204,7 @@ type PubSubRouter interface {
 	// Allows routers with internal scoring to vet peers before committing any processing resources
 	// to the message and implement an effective graylist and react to validation queue overload.
 	AcceptFrom(peer.ID) AcceptStatus
+	ReceiveMessage(*Message)
 	// PreValidation is invoked on messages in the RPC envelope right before pushing it to
 	// the validation pipeline
 	PreValidation([]*Message)
@@ -260,7 +261,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		panic(err)
 	}
 	ps := &PubSub{
-		log:                   logg.New(f, "gossipsub", 0),
+		log:                   logg.New(f, "gossipsub: ", 0),
 		host:                  h,
 		ctx:                   ctx,
 		rt:                    rt,
@@ -1111,6 +1112,8 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			}
 
 			msg := &Message{pmsg, "", rpc.from, nil, false}
+			p.rt.ReceiveMessage(msg)
+
 			if p.shouldPush(msg) {
 				toPush = append(toPush, msg)
 			}

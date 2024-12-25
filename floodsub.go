@@ -72,6 +72,7 @@ func (fs *FloodSubRouter) AcceptFrom(peer.ID) AcceptStatus {
 }
 
 func (fs *FloodSubRouter) PreValidation([]*Message) {}
+func (fs *FloodSubRouter) ReceiveMessage(*Message)  {}
 
 func (fs *FloodSubRouter) HandleRPC(rpc *RPC) {}
 
