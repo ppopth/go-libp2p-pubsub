@@ -616,6 +616,7 @@ func (gs *GossipSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
 	log.Debugf("PEERUP: Add new peer %s using %s", p, proto)
 	gs.tracer.AddPeer(p, proto)
 	gs.peers[p] = proto
+	gs.p.log.Printf("AddPeer %s using %s", p, proto)
 
 	// track the connection direction
 	outbound := false

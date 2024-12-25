@@ -43,6 +43,7 @@ func (p *PubSub) getHelloPacket() *RPC {
 
 func (p *PubSub) handleNewStream(s network.Stream) {
 	peer := s.Conn().RemotePeer()
+	p.log.Printf("handleNewStream %s", peer)
 
 	p.inboundStreamsMx.Lock()
 	other, dup := p.inboundStreams[peer]
