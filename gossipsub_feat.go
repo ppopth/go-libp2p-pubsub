@@ -23,7 +23,7 @@ const (
 )
 
 // GossipSubDefaultProtocols is the default gossipsub router protocol list
-var GossipSubDefaultProtocols = []protocol.ID{GossipSubID_v12, GossipSubID_v11, GossipSubID_v10, FloodSubID}
+var GossipSubDefaultProtocols = []protocol.ID{GossipSubID_v11, GossipSubID_v10, FloodSubID}
 
 // GossipSubDefaultFeatures is the feature test function for the default gossipsub protocols
 func GossipSubDefaultFeatures(feat GossipSubFeature, proto protocol.ID) bool {

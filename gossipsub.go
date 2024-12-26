@@ -724,9 +724,9 @@ func (gs *GossipSubRouter) PreValidation(msgs []*Message) {
 		for p := range gs.mesh[topic] {
 			// send to only peers that support IDONTWANT
 			if gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) {
-				idontwant := []*pb.ControlIDontWant{{MessageIDs: mids}}
-				out := rpcWithControl(nil, nil, nil, nil, nil, idontwant)
-				gs.sendRPC(p, out, true)
+				// idontwant := []*pb.ControlIDontWant{{MessageIDs: mids}}
+				// out := rpcWithControl(nil, nil, nil, nil, nil, idontwant)
+				// gs.sendRPC(p, out, true)
 			}
 		}
 	}
@@ -1055,7 +1055,9 @@ func (gs *GossipSubRouter) handleIDontWant(p peer.ID, ctl *pb.ControlMessage) {
 	// Remember all the unwanted message ids
 	for _, idontwant := range ctl.GetIdontwant() {
 		for _, mid := range idontwant.GetMessageIDs() {
-			gs.unwanted[p][computeChecksum(mid)] = gs.params.IDontWantMessageTTL
+			encodedMid := base64.StdEncoding.EncodeToString([]byte(mid))
+			gs.p.log.Printf("%s: received idontwant mid=%s pid=%s\n", time.Now(), encodedMid, p)
+			// gs.unwanted[p][computeChecksum(mid)] = gs.params.IDontWantMessageTTL
 		}
 	}
 }
@@ -1220,12 +1222,12 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 		}
 
 		for p := range gmap {
-			mid := gs.p.idGen.ID(msg)
+			// mid := gs.p.idGen.ID(msg)
 			// Check if it has already received an IDONTWANT for the message.
 			// If so, don't send it to the peer
-			if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok {
-				continue
-			}
+			// if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok {
+			// 	continue
+			// }
 			tosend[p] = struct{}{}
 		}
 	}
