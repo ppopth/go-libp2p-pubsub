@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"sort"
+	"strings"
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
@@ -983,6 +984,28 @@ func (gs *GossipSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			continue
 		}
 
+		var av string
+		raw, err := gs.p.host.Peerstore().Get(p, "AgentVersion")
+		if err == nil {
+			av, _ = raw.(string)
+		}
+		isLighthouse := strings.HasPrefix(av, "Lighthouse")
+		isRightVersion := strings.HasPrefix(av, "Lighthouse/v6.")
+		is53Version := strings.HasPrefix(av, "Lighthouse/v5.3")
+		isRightTopic := strings.Contains(topic, "beacon_block") || strings.Contains(topic, "blob")
+
+		if isRightTopic && (!gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) || (isLighthouse && !isRightVersion)) {
+			prune = append(prune, topic)
+			gs.addBackoff(p, topic, false)
+			continue
+		}
+
+		if !isRightVersion && (isLighthouse && is53Version) {
+			prune = append(prune, topic)
+			gs.addBackoff(p, topic, false)
+			continue
+		}
+
 		log.Debugf("GRAFT: add mesh link from %s in %s", p, topic)
 		gs.tracer.Graft(p, topic)
 		if _, ok := peers[p]; !ok {
@@ -1055,6 +1078,8 @@ func (gs *GossipSubRouter) handleIDontWant(p peer.ID, ctl *pb.ControlMessage) {
 	// Remember all the unwanted message ids
 	for _, idontwant := range ctl.GetIdontwant() {
 		for _, mid := range idontwant.GetMessageIDs() {
+			encodedMid := base64.StdEncoding.EncodeToString([]byte(mid))
+			gs.p.log.Printf("%s: received idontwant mid=%s pid=%s\n", time.Now(), encodedMid, p)
 			gs.unwanted[p][computeChecksum(mid)] = gs.params.IDontWantMessageTTL
 		}
 	}
@@ -1224,6 +1249,19 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 			// Check if it has already received an IDONTWANT for the message.
 			// If so, don't send it to the peer
 			if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok {
+				var peerType string
+				if _, ok := gs.direct[p]; ok {
+					peerType = "direct"
+				} else if _, ok := gs.mesh[topic][p]; ok {
+					peerType = "mesh"
+				} else if _, ok := tmap[p]; ok {
+					peerType = "peer"
+				} else {
+					peerType = "outsider"
+				}
+
+				encodedMid := base64.StdEncoding.EncodeToString([]byte(mid))
+				gs.p.log.Printf("%s: message dropped by idontwant topic=%s mid=%s pid=%s peerType=%s\n", time.Now(), topic, encodedMid, p, peerType)
 				continue
 			}
 			tosend[p] = struct{}{}
@@ -2190,6 +2228,24 @@ func (gs *GossipSubRouter) getPeers(topic string, count int, filter func(peer.ID
 
 	peers := make([]peer.ID, 0, len(tmap))
 	for p := range tmap {
+		var av string
+		raw, err := gs.p.host.Peerstore().Get(p, "AgentVersion")
+		if err == nil {
+			av, _ = raw.(string)
+		}
+		isLighthouse := strings.HasPrefix(av, "Lighthouse")
+		isRightVersion := strings.HasPrefix(av, "Lighthouse/v6.")
+		is53Version := strings.HasPrefix(av, "Lighthouse/v5.3")
+		isRightTopic := strings.Contains(topic, "beacon_block") || strings.Contains(topic, "blob")
+
+		if isRightTopic && (!gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) || (isLighthouse && !isRightVersion)) {
+			continue
+		}
+
+		if !isRightVersion && (isLighthouse && is53Version) {
+			continue
+		}
+
 		if gs.feature(GossipSubFeatureMesh, gs.peers[p]) && filter(p) && gs.p.peerFilter(p, topic) {
 			peers = append(peers, p)
 		}
