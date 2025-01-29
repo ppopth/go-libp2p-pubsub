@@ -1312,6 +1312,7 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 	lazyOut := rpcWithControl(nil, nil, nil, nil, nil, nil, iannounce, nil)
 
 	eagerOut := rpcWithMessages(msg.Message)
+	fmt.Printf("xx %s\n", mid)
 
 	for pid := range tosend {
 		if pid == from || pid == peer.ID(msg.GetFrom()) {
