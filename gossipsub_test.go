@@ -3504,6 +3504,85 @@ func TestGossipsubIannounceIneedMeshPeer(t *testing.T) {
 	<-ctx.Done()
 }
 
+// Test that IANNOUNCE is sent to mesh peers and the message is not sent after sending INEED
+// if the option ignoreIneed is enabled
+func TestGossipsubIannounceIneedMeshPeerWithIgnoreIneed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 2)
+
+	params := DefaultGossipSubParams()
+	params.Dannounce = params.D
+	psub := getGossipsub(ctx, hosts[0], WithGossipSubParams(params), WithIgnoreIneed(true))
+	_, err := psub.Subscribe("foobar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait a bit after the last message before checking we got the right messages
+	msgTimer := time.NewTimer(1 * time.Second)
+
+	// Checks we received the right messages
+	msgCount := 0
+	checkMsgs := func() {
+		if msgCount != 0 {
+			t.Fatalf("Expected no message received, got %d", msgCount)
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockGS(ctx, t, hosts[1], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// When the first peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the topic and grafting to the first peer
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Topicid: sub.Topicid}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{TopicID: sub.Topicid}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the first peer
+					// received and processed the subscribe + graft
+					time.Sleep(100 * time.Millisecond)
+					// Publish messages from the first peer
+					data := []byte("mymessage")
+					psub.Publish("foobar", data)
+				}()
+			}
+		}
+		if len(irpc.GetControl().GetIannounce()) > 0 {
+			var ineeds []*pb.ControlINeed
+			for _, iannounce := range irpc.GetControl().GetIannounce() {
+				mid := iannounce.GetMessageID()
+				ineed := &pb.ControlINeed{
+					MessageID: &mid,
+				}
+				ineeds = append(ineeds, ineed)
+			}
+			writeMsg(&pb.RPC{
+				Control: &pb.ControlMessage{Ineed: ineeds},
+			})
+		}
+		msgCount += len(irpc.GetPublish())
+	})
+
+	connect(t, hosts[0], hosts[1])
+
+	<-ctx.Done()
+}
+
 // Test that IANNOUNCE is sent to direct peers
 func TestGossipsubIannounceDirectPeer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

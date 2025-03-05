@@ -381,6 +381,22 @@ func WithPeerScore(params *PeerScoreParams, thresholds *PeerScoreThresholds) Opt
 	}
 }
 
+// WithIgnoreIneed is a gossipsub router option that ignores INEED control messages.
+// This enables us to emulate a malicious node who doesn't respond to INEED and tries
+// to delay the message arrivals of the overall network.
+func WithIgnoreIneed(ignoreIneed bool) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+
+		gs.ignoreIneed = ignoreIneed
+
+		return nil
+	}
+}
+
 // WithFloodPublish is a gossipsub router option that enables flood publishing.
 // When this is enabled, published messages are forwarded to all peers with score >=
 // to publishThreshold
@@ -536,6 +552,9 @@ type GossipSubRouter struct {
 
 	// threshold for median peer score before triggering opportunistic grafting
 	opportunisticGraftThreshold float64
+
+	// whether to ignore INEED
+	ignoreIneed bool
 
 	// whether to use flood publishing
 	floodPublish bool
@@ -926,6 +945,9 @@ func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.
 }
 
 func (gs *GossipSubRouter) handleINeed(p peer.ID, ctl *pb.ControlMessage) []*pb.Message {
+	if gs.ignoreIneed {
+		return nil
+	}
 	ihave := make(map[string]*pb.Message)
 	for _, ineed := range ctl.GetIneed() {
 		mid := ineed.GetMessageID()
