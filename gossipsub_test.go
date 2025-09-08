@@ -3886,3 +3886,65 @@ func BenchmarkSplitRPCLargeMessages(b *testing.B) {
 		}
 	})
 }
+
+func TestGossipsubMessageBatching(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	topicName := "foobar"
+
+	h := getDefaultHosts(t, 3)
+	psubs := getGossipsubs(ctx, h[:2], WithMessageBatching(topicName, 20))
+
+	rpcsReceived := make(chan int)
+	psub := getGossipsub(ctx, h[2], WithRawTracer(&mockRawTracer{
+		onRecvRPC: func(rpc *RPC) {
+			if len(rpc.GetPublish()) > 0 {
+				rpcsReceived <- len(rpc.GetPublish())
+			}
+		},
+	}))
+	psubs = append(psubs, psub)
+
+	connect(t, h[0], h[1])
+	connect(t, h[0], h[2])
+
+	// build the mesh
+	var topics []*Topic
+	for _, ps := range psubs {
+		topic, err := ps.Join(topicName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		topics = append(topics, topic)
+
+		_, err = topic.Subscribe()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Second)
+
+	// publish some messages
+	for i := 0; i < 3; i++ {
+		data := make([]byte, 9)
+		crand.Read(data)
+		topics[0].Publish(context.Background(), data)
+	}
+	time.Sleep(time.Second)
+
+	// since each message is 9 bytes long and the max batched size is 20, there
+	// should be two rpcs. One with 2 messages, and another with 1 message
+	expected := []int{2, 1}
+	timeout := time.After(5 * time.Second)
+	for i, exp := range expected {
+		select {
+		case count := <-rpcsReceived:
+			if count != exp {
+				t.Fatalf("Expected %d messages batched in RPC #%d, found %d", exp, i+1, count)
+			}
+		case <-timeout:
+			t.Fatal("Batched publish should have been sent")
+		}
+	}
+}
