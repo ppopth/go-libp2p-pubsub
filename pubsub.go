@@ -133,8 +133,8 @@ type PubSub struct {
 	// topics tracks which topics each of our peers are subscribed to
 	topics map[string]map[peer.ID]struct{}
 
-	// sendMsg handles messages that have been validated
-	sendMsg chan *Message
+	// sendMsgs handles messages that have been validated
+	sendMsgs chan []*Message
 
 	// sendMessageBatch publishes a batch of messages
 	sendMessageBatch chan messageBatchAndPublishOptions
@@ -212,8 +212,8 @@ type PubSubRouter interface {
 	// HandleRPC is invoked to process control messages in the RPC envelope.
 	// It is invoked after subscriptions and payload messages have been processed.
 	HandleRPC(*RPC)
-	// Publish is invoked to forward a new message that has been validated.
-	Publish(*Message)
+	// Publish is invoked to forward new messages that has been validated.
+	Publish([]*Message)
 	// Join notifies the router that we want to receive and forward messages in a topic.
 	// It is invoked after the subscription announcement.
 	Join(topic string)
@@ -485,7 +485,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		addTopic:              make(chan *addTopicReq),
 		rmTopic:               make(chan *rmTopicReq),
 		getTopics:             make(chan *topicReq),
-		sendMsg:               make(chan *Message, 32),
+		sendMsgs:              make(chan []*Message, 32),
 		sendMessageBatch:      make(chan messageBatchAndPublishOptions, 1),
 		addVal:                make(chan *addValReq),
 		rmVal:                 make(chan *rmValReq),
@@ -845,8 +845,8 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		case rpc := <-p.incoming:
 			p.handleIncomingRPC(rpc)
 
-		case msg := <-p.sendMsg:
-			p.publishMessage(msg)
+		case msgs := <-p.sendMsgs:
+			p.publishMessages(msgs)
 
 		case batchAndOpts := <-p.sendMessageBatch:
 			p.publishMessageBatch(batchAndOpts)
@@ -1386,7 +1386,7 @@ func (p *PubSub) pushMsg(msg *Message) {
 	}
 
 	if p.markSeen(id) {
-		p.publishMessage(msg)
+		p.publishMessages([]*Message{msg})
 	}
 }
 
@@ -1422,12 +1422,16 @@ func (p *PubSub) checkSigningPolicy(msg *Message) error {
 	return nil
 }
 
-func (p *PubSub) publishMessage(msg *Message) {
-	p.tracer.DeliverMessage(msg)
-	p.notifySubs(msg)
-	if !msg.Local {
-		p.rt.Publish(msg)
+func (p *PubSub) publishMessages(msgs []*Message) {
+	var toPublish []*Message
+	for _, msg := range msgs {
+		p.tracer.DeliverMessage(msg)
+		p.notifySubs(msg)
+		if !msg.Local {
+			toPublish = append(toPublish, msg)
+		}
 	}
+	p.rt.Publish(toPublish)
 }
 
 func (p *PubSub) publishMessageBatch(batchAndOpts messageBatchAndPublishOptions) {

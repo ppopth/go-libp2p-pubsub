@@ -298,7 +298,16 @@ func (v *validation) validateWorker() {
 
 func (v *validation) sendMsgBlocking(msg *Message) error {
 	select {
-	case v.p.sendMsg <- msg:
+	case v.p.sendMsgs <- []*Message{msg}:
+		return nil
+	case <-v.p.ctx.Done():
+		return v.p.ctx.Err()
+	}
+}
+
+func (v *validation) sendMsgsBlocking(msgs []*Message) error {
+	select {
+	case v.p.sendMsgs <- msgs:
 		return nil
 	case <-v.p.ctx.Done():
 		return v.p.ctx.Err()
