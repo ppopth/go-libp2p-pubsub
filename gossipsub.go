@@ -296,6 +296,9 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 		feature:      GossipSubDefaultFeatures,
 		tagTracer:    newTagTracer(h.ConnManager()),
 		params:       params,
+		maxbatch:     make(map[string]int),
+		batchQ:       make(map[string][]*Message),
+		batchQSize:   make(map[string]int),
 	}
 }
 
@@ -394,6 +397,20 @@ func WithFloodPublish(floodPublish bool) Option {
 
 		gs.floodPublish = floodPublish
 
+		return nil
+	}
+}
+
+// WithMessageBatching is a gossipsub router option that enables message batching.
+// When the max size of a particular topic is set, the router will try to batch messages
+// of that topic in a single message so that it has less packet header overhead.
+func WithMessageBatching(topic string, maxBatchedSize int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+		gs.maxbatch[topic] = maxBatchedSize
 		return nil
 	}
 }
@@ -501,6 +518,10 @@ type GossipSubRouter struct {
 	backoff      map[string]map[peer.ID]time.Time // prune backoff
 	connect      chan connectInfo                 // px connection requests
 	cab          peerstore.AddrBook
+
+	maxbatch   map[string]int        // maximum size of a batch in bytes for each topic
+	batchQ     map[string][]*Message // queue of messages to be sent in the next batch for each topic
+	batchQSize map[string]int        // current total bytes of the queue for each topic
 
 	protos  []protocol.ID
 	feature GossipSubFeatureTest
@@ -1173,7 +1194,7 @@ func (gs *GossipSubRouter) PublishBatch(messages []*Message, opts *BatchPublishO
 	strategy := opts.Strategy
 	for _, msg := range messages {
 		msgID := gs.p.idGen.ID(msg)
-		for p, rpc := range gs.rpcs(msg) {
+		for p, rpc := range gs.rpcs(msg.GetTopic(), []*Message{msg}) {
 			strategy.AddRPC(p, msgID, rpc)
 		}
 	}
@@ -1184,69 +1205,122 @@ func (gs *GossipSubRouter) PublishBatch(messages []*Message, opts *BatchPublishO
 }
 
 func (gs *GossipSubRouter) Publish(msg *Message) {
-	for p, rpc := range gs.rpcs(msg) {
+	size := len(msg.GetData())
+	topic := msg.GetTopic()
+
+	// if the max size is zero, it means that batching is disabled for the topic
+	if gs.maxbatch[topic] == 0 {
+		// send the mesage right away
+		for p, rpc := range gs.rpcs(topic, []*Message{msg}) {
+			gs.sendRPC(p, rpc, false)
+		}
+		return
+	}
+
+	if gs.batchQSize[topic]+size < gs.maxbatch[topic] {
+		// if the total size doesn't exceed the max size yet, wait for more messages
+		gs.batchQ[topic] = append(gs.batchQ[topic], msg)
+		gs.batchQSize[topic] += size
+		return
+	}
+
+	// if the total size is about to exceed, send the current batch
+	for p, rpc := range gs.rpcs(topic, gs.batchQ[topic]) {
 		gs.sendRPC(p, rpc, false)
 	}
+
+	// reset the queue and enque the latest message
+	gs.batchQ[topic] = []*Message{msg}
+	gs.batchQSize[topic] = size
 }
 
-func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
+func (gs *GossipSubRouter) rpcs(topic string, messages []*Message) iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
-		gs.mcache.Put(msg)
+		for _, msg := range messages {
+			gs.mcache.Put(msg)
+		}
 
-		from := msg.ReceivedFrom
-		topic := msg.GetTopic()
-
-		tosend := make(map[peer.ID]struct{})
-
+		// lists of messages to send to each peer
+		tosend := make(map[peer.ID]map[*Message]struct{})
+		appendTosend := func(p peer.ID, msgs ...*Message) {
+			if tosend[p] == nil {
+				tosend[p] = make(map[*Message]struct{})
+			}
+			for _, msg := range msgs {
+				tosend[p][msg] = struct{}{}
+			}
+		}
 		// any peers in the topic?
 		tmap, ok := gs.p.topics[topic]
 		if !ok {
 			return
 		}
+		// no need to send if there is no message
+		if len(messages) == 0 {
+			return
+		}
+		// a list of locally published messages
+		var localMsgs []*Message
+		// a list of messages supposed to be sent to mesh peers
+		var meshMsgs []*Message
 
-		if gs.floodPublish && from == gs.p.host.ID() {
+		for _, msg := range messages {
+			if msg.ReceivedFrom == gs.p.host.ID() {
+				// save locally published messages
+				localMsgs = append(localMsgs, msg)
+			} else {
+				// non-local messages are supposed to be sent to mesh peers
+				meshMsgs = append(meshMsgs, msg)
+			}
+		}
+
+		if gs.floodPublish {
 			for p := range tmap {
 				_, direct := gs.direct[p]
 				if direct || gs.score.Score(p) >= gs.publishThreshold {
-					tosend[p] = struct{}{}
+					appendTosend(p, localMsgs...)
 				}
 			}
 		} else {
-			// direct peers
-			for p := range gs.direct {
-				_, inTopic := tmap[p]
-				if inTopic {
-					tosend[p] = struct{}{}
+			meshMsgs = append(meshMsgs, localMsgs...)
+		}
+
+		// direct peers
+		for p := range gs.direct {
+			_, inTopic := tmap[p]
+			if inTopic {
+				appendTosend(p, meshMsgs...)
+			}
+		}
+
+		// floodsub peers
+		for p := range tmap {
+			if !gs.feature(GossipSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.publishThreshold {
+				appendTosend(p, meshMsgs...)
+			}
+		}
+
+		// gossipsub peers
+		gmap, ok := gs.mesh[topic]
+		if !ok {
+			// we are not in the mesh for topic, use fanout peers
+			gmap, ok = gs.fanout[topic]
+			if !ok || len(gmap) == 0 {
+				// we don't have any, pick some with score above the publish threshold
+				peers := gs.getPeers(topic, gs.params.D, func(p peer.ID) bool {
+					_, direct := gs.direct[p]
+					return !direct && gs.score.Score(p) >= gs.publishThreshold
+				})
+
+				if len(peers) > 0 {
+					gmap = peerListToMap(peers)
+					gs.fanout[topic] = gmap
 				}
 			}
+			gs.lastpub[topic] = time.Now().UnixNano()
+		}
 
-			// floodsub peers
-			for p := range tmap {
-				if !gs.feature(GossipSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.publishThreshold {
-					tosend[p] = struct{}{}
-				}
-			}
-
-			// gossipsub peers
-			gmap, ok := gs.mesh[topic]
-			if !ok {
-				// we are not in the mesh for topic, use fanout peers
-				gmap, ok = gs.fanout[topic]
-				if !ok || len(gmap) == 0 {
-					// we don't have any, pick some with score above the publish threshold
-					peers := gs.getPeers(topic, gs.params.D, func(p peer.ID) bool {
-						_, direct := gs.direct[p]
-						return !direct && gs.score.Score(p) >= gs.publishThreshold
-					})
-
-					if len(peers) > 0 {
-						gmap = peerListToMap(peers)
-						gs.fanout[topic] = gmap
-					}
-				}
-				gs.lastpub[topic] = time.Now().UnixNano()
-			}
-
+		for _, msg := range meshMsgs {
 			csum := computeChecksum(gs.p.idGen.ID(msg))
 			for p := range gmap {
 				// Check if it has already received an IDONTWANT for the message.
@@ -1254,18 +1328,22 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 				if _, ok := gs.unwanted[p][csum]; ok {
 					continue
 				}
-				tosend[p] = struct{}{}
+				appendTosend(p, msg)
 			}
 		}
 
-		out := rpcWithMessages(msg.Message)
-		for pid := range tosend {
-			if pid == from || pid == peer.ID(msg.GetFrom()) {
-				continue
+		for pid, mmap := range tosend {
+			var msgs []*pb.Message
+			for msg := range mmap {
+				if pid == msg.ReceivedFrom || pid == peer.ID(msg.GetFrom()) {
+					continue
+				}
+				msgs = append(msgs, msg.Message)
 			}
 
-			if !yield(pid, out) {
-				return
+			if len(msgs) > 0 {
+				out := rpcWithMessages(msgs...)
+				yield(pid, out)
 			}
 		}
 	}
@@ -1475,6 +1553,16 @@ func (gs *GossipSubRouter) heartbeat() {
 	tograft := make(map[peer.ID][]string)
 	toprune := make(map[peer.ID][]string)
 	noPX := make(map[peer.ID]bool)
+
+	// send all the pending messages in the batch queues
+	for topic := range gs.batchQ {
+		for p, rpc := range gs.rpcs(topic, gs.batchQ[topic]) {
+			gs.sendRPC(p, rpc, false)
+		}
+		// clear the queue
+		gs.batchQ[topic] = nil
+		gs.batchQSize[topic] = 0
+	}
 
 	// clean up expired backoffs
 	gs.clearBackoff()
