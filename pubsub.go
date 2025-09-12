@@ -1346,9 +1346,7 @@ func (p *PubSub) handleIncomingRPCs(rpcs []*RPC) {
 		}
 		toProcess = append(toProcess, rpc)
 	}
-	for _, msg := range toPush {
-		p.pushMsg(msg)
-	}
+	p.pushMsgs(toPush)
 	for _, rpc := range toProcess {
 		p.rt.HandleRPC(rpc)
 	}
@@ -1407,16 +1405,19 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 }
 
 // pushMsg pushes a message performing validation as necessary
-func (p *PubSub) pushMsg(msg *Message) {
-	src := msg.ReceivedFrom
-	id := p.idGen.ID(msg)
+func (p *PubSub) pushMsgs(msgs []*Message) {
+	// The returned list is the list of messages that can be published immediately
+	syncMsgs := p.val.Push(msgs)
 
-	if !p.val.Push(src, msg) {
-		return
+	var toPublish []*Message
+	for _, msg := range syncMsgs {
+		id := p.idGen.ID(msg)
+		if p.markSeen(id) {
+			toPublish = append(toPublish, msg)
+		}
 	}
-
-	if p.markSeen(id) {
-		p.publishMessages([]*Message{msg})
+	if len(toPublish) > 0 {
+		p.publishMessages(toPublish)
 	}
 }
 

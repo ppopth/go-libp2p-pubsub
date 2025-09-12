@@ -82,7 +82,7 @@ type validation struct {
 	defaultVals []*validatorImpl
 
 	// validateQ is the front-end to the validation pipeline
-	validateQ chan *validateReq
+	validateQ chan []*validateReq
 
 	// validateThrottle limits the number of active validation goroutines
 	validateThrottle chan struct{}
@@ -127,7 +127,7 @@ type rmValReq struct {
 func newValidation() *validation {
 	return &validation{
 		topicVals:        make(map[string]*validatorImpl),
-		validateQ:        make(chan *validateReq, defaultValidateQueueSize),
+		validateQ:        make(chan []*validateReq, defaultValidateQueueSize),
 		validateThrottle: make(chan struct{}, defaultValidateThrottle),
 		validateWorkers:  runtime.NumCPU(),
 	}
@@ -242,28 +242,48 @@ func (v *validation) ValidateLocal(msg *Message) error {
 		return err
 	}
 
-	vals := v.getValidators(msg)
-	return v.validate(vals, msg.ReceivedFrom, msg, true, func(msg *Message) error {
+	req := &validateReq{
+		vals: v.getValidators(msg),
+		src:  msg.ReceivedFrom,
+		msg:  msg,
+	}
+	errs := v.validate([]*validateReq{req}, true, func(msgs []*Message) error {
 		return nil
 	})
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
 }
 
-// Push pushes a message into the validation pipeline.
-// It returns true if the message can be forwarded immediately without validation.
-func (v *validation) Push(src peer.ID, msg *Message) bool {
-	vals := v.getValidators(msg)
+// Push pushes messages into the validation pipeline.
+// It returns the messages that can be forwarded immediately without validation.
+func (v *validation) Push(msgs []*Message) []*Message {
+	var reqs []*validateReq
+	var rets []*Message
 
-	if len(vals) > 0 || msg.Signature != nil {
-		select {
-		case v.validateQ <- &validateReq{vals, src, msg}:
-		default:
-			log.Debugf("message validation throttled: queue full; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, RejectValidationQueueFull)
+	for _, msg := range msgs {
+		src := msg.ReceivedFrom
+		vals := v.getValidators(msg)
+
+		if len(vals) > 0 || msg.Signature != nil {
+			reqs = append(reqs, &validateReq{vals, src, msg})
+		} else {
+			rets = append(rets, msg)
 		}
-		return false
+	}
+	if len(reqs) > 0 {
+		select {
+		case v.validateQ <- reqs:
+		default:
+			log.Debugf("message validation throttled: queue full; dropping messages")
+			for _, req := range reqs {
+				v.tracer.RejectMessage(req.msg, RejectValidationQueueFull)
+			}
+		}
 	}
 
-	return true
+	return rets
 }
 
 // getValidators returns all validators that apply to a given message
@@ -288,8 +308,8 @@ func (v *validation) getValidators(msg *Message) []*validatorImpl {
 func (v *validation) validateWorker() {
 	for {
 		select {
-		case req := <-v.validateQ:
-			_ = v.validate(req.vals, req.src, req.msg, false, v.sendMsgBlocking)
+		case reqs := <-v.validateQ:
+			_ = v.validate(reqs, false, v.sendMsgsBlocking)
 		case <-v.p.ctx.Done():
 			return
 		}
@@ -317,78 +337,108 @@ func (v *validation) sendMsgsBlocking(msgs []*Message) error {
 // validate performs validation and only calls onValid if all validators succeed.
 // If synchronous is true, onValid will be called before this function returns
 // if the message is new and accepted.
-func (v *validation) validate(vals []*validatorImpl, src peer.ID, msg *Message, synchronous bool, onValid func(*Message) error) error {
-	// If signature verification is enabled, but signing is disabled,
-	// the Signature is required to be nil upon receiving the message in PubSub.pushMsg.
-	if msg.Signature != nil {
-		if !v.validateSignature(msg) {
-			log.Debugf("message signature validation failed; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, RejectInvalidSignature)
-			return ValidationError{Reason: RejectInvalidSignature}
+func (v *validation) validate(reqs []*validateReq, synchronous bool, onValid func([]*Message) error) []error {
+	var asyncReqs []*validateReq
+	var asyncResults []ValidationResult
+	var syncAcceptedMsgs []*Message
+	var errs []error
+
+	for _, req := range reqs {
+		vals := req.vals
+		msg := req.msg
+		src := req.src
+
+		// If signature verification is enabled, but signing is disabled,
+		// the Signature is required to be nil upon receiving the message in PubSub.pushMsg.
+		if msg.Signature != nil {
+			if !v.validateSignature(msg) {
+				log.Debugf("message signature validation failed; dropping message from %s", src)
+				v.tracer.RejectMessage(msg, RejectInvalidSignature)
+				errs = append(errs, ValidationError{Reason: RejectInvalidSignature})
+				continue
+			}
 		}
-	}
 
-	// we can mark the message as seen now that we have verified the signature
-	// and avoid invoking user validators more than once
-	id := v.p.idGen.ID(msg)
-	if !v.p.markSeen(id) {
-		v.tracer.DuplicateMessage(msg)
-		return dupeErr{}
-	} else {
-		v.tracer.ValidateMessage(msg)
-	}
-
-	var inline, async []*validatorImpl
-	for _, val := range vals {
-		if val.validateInline || synchronous {
-			inline = append(inline, val)
+		// we can mark the message as seen now that we have verified the signature
+		// and avoid invoking user validators more than once
+		id := v.p.idGen.ID(msg)
+		if !v.p.markSeen(id) {
+			v.tracer.DuplicateMessage(msg)
+			errs = append(errs, dupeErr{})
+			continue
 		} else {
-			async = append(async, val)
+			v.tracer.ValidateMessage(msg)
 		}
-	}
 
-	// apply inline (synchronous) validators
-	result := ValidationAccept
-loop:
-	for _, val := range inline {
-		switch val.validateMsg(v.p.ctx, src, msg) {
-		case ValidationAccept:
-		case ValidationReject:
-			result = ValidationReject
-			break loop
-		case ValidationIgnore:
-			result = ValidationIgnore
+		var inline, async []*validatorImpl
+		for _, val := range vals {
+			if val.validateInline || synchronous {
+				inline = append(inline, val)
+			} else {
+				async = append(async, val)
+			}
 		}
-	}
 
-	if result == ValidationReject {
-		log.Debugf("message validation failed; dropping message from %s", src)
-		v.tracer.RejectMessage(msg, RejectValidationFailed)
-		return ValidationError{Reason: RejectValidationFailed}
-	}
+		// apply inline (synchronous) validators
+		result := ValidationAccept
+	loop:
+		for _, val := range inline {
+			switch val.validateMsg(v.p.ctx, src, msg) {
+			case ValidationAccept:
+			case ValidationReject:
+				result = ValidationReject
+				break loop
+			case ValidationIgnore:
+				result = ValidationIgnore
+			}
+		}
 
-	// apply async validators
-	if len(async) > 0 {
+		if result == ValidationReject {
+			log.Debugf("message validation failed; dropping message from %s", src)
+			v.tracer.RejectMessage(msg, RejectValidationFailed)
+			errs = append(errs, ValidationError{Reason: RejectValidationFailed})
+			continue
+		}
+
+		// apply async validators
+		if len(async) > 0 {
+			req := &validateReq{
+				vals: async,
+				src:  src,
+				msg:  msg,
+			}
+			asyncReqs = append(asyncReqs, req)
+			asyncResults = append(asyncResults, result)
+			continue
+		}
+
+		if result == ValidationIgnore {
+			v.tracer.RejectMessage(msg, RejectValidationIgnored)
+			errs = append(errs, ValidationError{Reason: RejectValidationIgnored})
+			continue
+		}
+
+		// no async validators, accepted message
+		syncAcceptedMsgs = append(syncAcceptedMsgs, msg)
+	}
+	// run the handler for the synchronously accepted messages
+	onValid(syncAcceptedMsgs)
+
+	if len(asyncReqs) > 0 {
 		select {
 		case v.validateThrottle <- struct{}{}:
 			go func() {
-				v.doValidateTopic(async, src, msg, result, onValid)
+				v.doValidateTopic(asyncReqs, asyncResults, onValid)
 				<-v.validateThrottle
 			}()
 		default:
-			log.Debugf("message validation throttled; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, RejectValidationThrottled)
+			log.Debugf("message validation throttled; dropping messages")
+			for _, req := range asyncReqs {
+				v.tracer.RejectMessage(req.msg, RejectValidationThrottled)
+			}
 		}
-		return nil
 	}
-
-	if result == ValidationIgnore {
-		v.tracer.RejectMessage(msg, RejectValidationIgnored)
-		return ValidationError{Reason: RejectValidationIgnored}
-	}
-
-	// no async validators, accepted message
-	return onValid(msg)
+	return errs
 }
 
 func (v *validation) validateSignature(msg *Message) bool {
@@ -401,32 +451,40 @@ func (v *validation) validateSignature(msg *Message) bool {
 	return true
 }
 
-func (v *validation) doValidateTopic(vals []*validatorImpl, src peer.ID, msg *Message, r ValidationResult, onValid func(*Message) error) {
-	result := v.validateTopic(vals, src, msg)
+func (v *validation) doValidateTopic(reqs []*validateReq, rs []ValidationResult, onValid func([]*Message) error) {
+	var accepted []*Message
+	for i, req := range reqs {
+		vals := req.vals
+		src := req.src
+		msg := req.msg
 
-	if result == ValidationAccept && r != ValidationAccept {
-		result = r
+		result := v.validateTopic(vals, src, msg)
+
+		if result == ValidationAccept && rs[i] != ValidationAccept {
+			result = rs[i]
+		}
+
+		switch result {
+		case ValidationAccept:
+			accepted = append(accepted, msg)
+		case ValidationReject:
+			log.Debugf("message validation failed; dropping message from %s", src)
+			v.tracer.RejectMessage(msg, RejectValidationFailed)
+			return
+		case ValidationIgnore:
+			log.Debugf("message validation punted; ignoring message from %s", src)
+			v.tracer.RejectMessage(msg, RejectValidationIgnored)
+			return
+		case validationThrottled:
+			log.Debugf("message validation throttled; ignoring message from %s", src)
+			v.tracer.RejectMessage(msg, RejectValidationThrottled)
+
+		default:
+			// BUG: this would be an internal programming error, so a panic seems appropiate.
+			panic(fmt.Errorf("unexpected validation result: %d", result))
+		}
 	}
-
-	switch result {
-	case ValidationAccept:
-		_ = onValid(msg)
-	case ValidationReject:
-		log.Debugf("message validation failed; dropping message from %s", src)
-		v.tracer.RejectMessage(msg, RejectValidationFailed)
-		return
-	case ValidationIgnore:
-		log.Debugf("message validation punted; ignoring message from %s", src)
-		v.tracer.RejectMessage(msg, RejectValidationIgnored)
-		return
-	case validationThrottled:
-		log.Debugf("message validation throttled; ignoring message from %s", src)
-		v.tracer.RejectMessage(msg, RejectValidationThrottled)
-
-	default:
-		// BUG: this would be an internal programming error, so a panic seems appropiate.
-		panic(fmt.Errorf("unexpected validation result: %d", result))
-	}
+	_ = onValid(accepted)
 }
 
 func (v *validation) validateTopic(vals []*validatorImpl, src peer.ID, msg *Message) ValidationResult {
@@ -551,7 +609,7 @@ func WithDefaultValidator(val interface{}, opts ...ValidatorOpt) Option {
 func WithValidateQueueSize(n int) Option {
 	return func(ps *PubSub) error {
 		if n > 0 {
-			ps.val.validateQ = make(chan *validateReq, n)
+			ps.val.validateQ = make(chan []*validateReq, n)
 			return nil
 		}
 		return fmt.Errorf("validate queue size must be > 0")
