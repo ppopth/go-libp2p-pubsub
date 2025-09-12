@@ -843,7 +843,19 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			}
 			preq.resp <- peers
 		case rpc := <-p.incoming:
-			p.handleIncomingRPC(rpc)
+			rpcs := []*RPC{rpc}
+			// drain all the rpcs in the queue
+		loop:
+			for {
+				select {
+				case rpc := <-p.incoming:
+					rpcs = append(rpcs, rpc)
+				default:
+					break loop
+				}
+			}
+
+			p.handleIncomingRPCs(rpcs)
 
 		case msgs := <-p.sendMsgs:
 			p.publishMessages(msgs)
@@ -1238,90 +1250,108 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 	}
 }
 
-func (p *PubSub) handleIncomingRPC(rpc *RPC) {
+func (p *PubSub) handleIncomingRPCs(rpcs []*RPC) {
 	// pass the rpc through app specific validation (if any available).
 	if p.appSpecificRpcInspector != nil {
-		// check if the RPC is allowed by the external inspector
-		if err := p.appSpecificRpcInspector(rpc.from, rpc); err != nil {
-			log.Debugf("application-specific inspection failed, rejecting incoming rpc: %s", err)
-			return // reject the RPC
-		}
-	}
+		filteredRpcs := []*RPC{}
 
-	p.tracer.RecvRPC(rpc)
-
-	subs := rpc.GetSubscriptions()
-	if len(subs) != 0 && p.subFilter != nil {
-		var err error
-		subs, err = p.subFilter.FilterIncomingSubscriptions(rpc.from, subs)
-		if err != nil {
-			log.Debugf("subscription filter error: %s; ignoring RPC", err)
-			return
-		}
-	}
-
-	for _, subopt := range subs {
-		t := subopt.GetTopicid()
-
-		if subopt.GetSubscribe() {
-			tmap, ok := p.topics[t]
-			if !ok {
-				tmap = make(map[peer.ID]struct{})
-				p.topics[t] = tmap
+		for _, rpc := range rpcs {
+			// check if the RPC is allowed by the external inspector
+			if err := p.appSpecificRpcInspector(rpc.from, rpc); err != nil {
+				log.Debugf("application-specific inspection failed, rejecting incoming rpc: %s", err)
+				continue
 			}
+			filteredRpcs = append(filteredRpcs, rpc)
+		}
+		rpcs = filteredRpcs
+	}
+	if len(rpcs) == 0 {
+		return
+	}
 
-			if _, ok = tmap[rpc.from]; !ok {
-				tmap[rpc.from] = struct{}{}
-				if topic, ok := p.myTopics[t]; ok {
-					peer := rpc.from
-					topic.sendNotification(PeerEvent{PeerJoin, peer})
+	for _, rpc := range rpcs {
+		p.tracer.RecvRPC(rpc)
+
+		subs := rpc.GetSubscriptions()
+		if len(subs) != 0 && p.subFilter != nil {
+			var err error
+			subs, err = p.subFilter.FilterIncomingSubscriptions(rpc.from, subs)
+			if err != nil {
+				log.Debugf("subscription filter error: %s; ignoring RPC", err)
+				continue
+			}
+		}
+
+		for _, subopt := range subs {
+			t := subopt.GetTopicid()
+
+			if subopt.GetSubscribe() {
+				tmap, ok := p.topics[t]
+				if !ok {
+					tmap = make(map[peer.ID]struct{})
+					p.topics[t] = tmap
+				}
+
+				if _, ok = tmap[rpc.from]; !ok {
+					tmap[rpc.from] = struct{}{}
+					if topic, ok := p.myTopics[t]; ok {
+						peer := rpc.from
+						topic.sendNotification(PeerEvent{PeerJoin, peer})
+					}
+				}
+			} else {
+				tmap, ok := p.topics[t]
+				if !ok {
+					continue
+				}
+
+				if _, ok := tmap[rpc.from]; ok {
+					delete(tmap, rpc.from)
+					p.notifyLeave(t, rpc.from)
 				}
 			}
-		} else {
-			tmap, ok := p.topics[t]
-			if !ok {
-				continue
-			}
-
-			if _, ok := tmap[rpc.from]; ok {
-				delete(tmap, rpc.from)
-				p.notifyLeave(t, rpc.from)
-			}
 		}
 	}
 
-	// ask the router to vet the peer before commiting any processing resources
-	switch p.rt.AcceptFrom(rpc.from) {
-	case AcceptNone:
-		log.Debugf("received RPC from router graylisted peer %s; dropping RPC", rpc.from)
-		return
+	var toPush []*Message
+	var toProcess []*RPC
+	for _, rpc := range rpcs {
+		// ask the router to vet the peer before commiting any processing resources
+		switch p.rt.AcceptFrom(rpc.from) {
+		case AcceptNone:
+			log.Debugf("received RPC from router graylisted peer %s; dropping RPC", rpc.from)
+			continue
 
-	case AcceptControl:
-		if len(rpc.GetPublish()) > 0 {
-			log.Debugf("peer %s was throttled by router; ignoring %d payload messages", rpc.from, len(rpc.GetPublish()))
-		}
-		p.tracer.ThrottlePeer(rpc.from)
-
-	case AcceptAll:
-		var toPush []*Message
-		for _, pmsg := range rpc.GetPublish() {
-			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
-				log.Debug("received message in topic we didn't subscribe to; ignoring message")
-				continue
+		case AcceptControl:
+			if len(rpc.GetPublish()) > 0 {
+				log.Debugf("peer %s was throttled by router; ignoring %d payload messages", rpc.from, len(rpc.GetPublish()))
 			}
+			p.tracer.ThrottlePeer(rpc.from)
 
-			msg := &Message{pmsg, "", rpc.from, nil, false}
-			if p.shouldPush(msg) {
-				toPush = append(toPush, msg)
+		case AcceptAll:
+			var msgs []*Message
+			for _, pmsg := range rpc.GetPublish() {
+				if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
+					log.Debug("received message in topic we didn't subscribe to; ignoring message")
+					continue
+				}
+
+				msg := &Message{pmsg, "", rpc.from, nil, false}
+				if p.shouldPush(msg) {
+					msgs = append(msgs, msg)
+					toPush = append(toPush, msg)
+				}
 			}
+			p.rt.Preprocess(rpc.from, msgs)
 		}
-		p.rt.Preprocess(rpc.from, toPush)
-		for _, msg := range toPush {
-			p.pushMsg(msg)
-		}
+		toProcess = append(toProcess, rpc)
 	}
-
-	p.rt.HandleRPC(rpc)
+	for _, msg := range toPush {
+		p.pushMsg(msg)
+	}
+	for _, rpc := range toProcess {
+		p.rt.HandleRPC(rpc)
+	}
 }
 
 // DefaultMsgIdFn returns a unique ID of the passed Message
