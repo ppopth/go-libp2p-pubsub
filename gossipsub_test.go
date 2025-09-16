@@ -3886,3 +3886,61 @@ func BenchmarkSplitRPCLargeMessages(b *testing.B) {
 		}
 	})
 }
+
+func TestGossipsubMessageBatching(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	topicName := "foobar"
+
+	h := getDefaultHosts(t, 3)
+	psubs := getGossipsubs(ctx, h[:2])
+
+	rpcsReceived := make(chan int)
+	psub := getGossipsub(ctx, h[2], WithRawTracer(&mockRawTracer{
+		onRecvRPC: func(rpc *RPC) {
+			if len(rpc.GetPublish()) > 0 {
+				rpcsReceived <- len(rpc.GetPublish())
+			}
+		},
+	}))
+	psubs = append(psubs, psub)
+
+	connect(t, h[0], h[1])
+	connect(t, h[0], h[2])
+
+	// build the mesh
+	var topics []*Topic
+	for _, ps := range psubs {
+		topic, err := ps.Join(topicName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		topics = append(topics, topic)
+
+		_, err = topic.Subscribe()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Second)
+
+	data := make([][]byte, 3)
+	// publish some messages
+	for i := 0; i < 3; i++ {
+		data[i] = make([]byte, 9)
+		crand.Read(data[i])
+	}
+	topics[0].PublishMany(context.Background(), data)
+	time.Sleep(time.Second)
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case count := <-rpcsReceived:
+		if count != 3 {
+			t.Fatalf("Expected 3 messages batched in the RPC, found %d", count)
+		}
+	case <-timeout:
+		t.Fatal("Batched publish should have been sent")
+	}
+}
