@@ -98,7 +98,13 @@ func (rs *RandomSubRouter) Preprocess(from peer.ID, msgs []*Message) {}
 
 func (rs *RandomSubRouter) HandleRPC(rpc *RPC) {}
 
-func (rs *RandomSubRouter) Publish(msg *Message) {
+func (rs *RandomSubRouter) Publish(msgs []*Message) {
+	for _, msg := range msgs {
+		rs.publish(msg)
+	}
+}
+
+func (rs *RandomSubRouter) publish(msg *Message) {
 	from := msg.ReceivedFrom
 
 	tosend := make(map[peer.ID]struct{})

@@ -246,6 +246,24 @@ func (t *Topic) Publish(ctx context.Context, data []byte, opts ...PubOpt) error 
 	return t.p.val.sendMsgBlocking(msg)
 }
 
+// PublishMany publishes many messages to the topic at once.
+func (t *Topic) PublishMany(ctx context.Context, messages [][]byte, opts ...PubOpt) error {
+	var msgs []*Message
+	for _, data := range messages {
+		msg, err := t.validate(ctx, data, opts...)
+		if err != nil {
+			if errors.Is(err, dupeErr{}) {
+				// If it was a duplicate, we return nil to indicate success.
+				// Semantically the message was published by us or someone else.
+				return nil
+			}
+			return err
+		}
+		msgs = append(msgs, msg)
+	}
+	return t.p.val.sendMsgsBlocking(msgs)
+}
+
 func (t *Topic) AddToBatch(ctx context.Context, batch *MessageBatch, data []byte, opts ...PubOpt) error {
 	msg, err := t.validate(ctx, data, opts...)
 	if err != nil {

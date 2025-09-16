@@ -75,7 +75,13 @@ func (fs *FloodSubRouter) Preprocess(from peer.ID, msgs []*Message) {}
 
 func (fs *FloodSubRouter) HandleRPC(rpc *RPC) {}
 
-func (fs *FloodSubRouter) Publish(msg *Message) {
+func (fs *FloodSubRouter) Publish(msgs []*Message) {
+	for _, msg := range msgs {
+		fs.publish(msg)
+	}
+}
+
+func (fs *FloodSubRouter) publish(msg *Message) {
 	from := msg.ReceivedFrom
 	topic := msg.GetTopic()
 

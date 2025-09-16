@@ -133,8 +133,8 @@ type PubSub struct {
 	// topics tracks which topics each of our peers are subscribed to
 	topics map[string]map[peer.ID]struct{}
 
-	// sendMsg handles messages that have been validated
-	sendMsg chan *Message
+	// sendMsgs handles messages that have been validated
+	sendMsgs chan []*Message
 
 	// sendMessageBatch publishes a batch of messages
 	sendMessageBatch chan messageBatchAndPublishOptions
@@ -212,8 +212,8 @@ type PubSubRouter interface {
 	// HandleRPC is invoked to process control messages in the RPC envelope.
 	// It is invoked after subscriptions and payload messages have been processed.
 	HandleRPC(*RPC)
-	// Publish is invoked to forward a new message that has been validated.
-	Publish(*Message)
+	// Publish is invoked to forward new messages that has been validated.
+	Publish([]*Message)
 	// Join notifies the router that we want to receive and forward messages in a topic.
 	// It is invoked after the subscription announcement.
 	Join(topic string)
@@ -485,7 +485,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		addTopic:              make(chan *addTopicReq),
 		rmTopic:               make(chan *rmTopicReq),
 		getTopics:             make(chan *topicReq),
-		sendMsg:               make(chan *Message, 32),
+		sendMsgs:              make(chan []*Message, 32),
 		sendMessageBatch:      make(chan messageBatchAndPublishOptions, 1),
 		addVal:                make(chan *addValReq),
 		rmVal:                 make(chan *rmValReq),
@@ -843,10 +843,22 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			}
 			preq.resp <- peers
 		case rpc := <-p.incoming:
-			p.handleIncomingRPC(rpc)
+			rpcs := []*RPC{rpc}
+			// drain all the rpcs in the queue
+		loop:
+			for {
+				select {
+				case rpc := <-p.incoming:
+					rpcs = append(rpcs, rpc)
+				default:
+					break loop
+				}
+			}
 
-		case msg := <-p.sendMsg:
-			p.publishMessage(msg)
+			p.handleIncomingRPCs(rpcs)
+
+		case msgs := <-p.sendMsgs:
+			p.publishMessages(msgs)
 
 		case batchAndOpts := <-p.sendMessageBatch:
 			p.publishMessageBatch(batchAndOpts)
@@ -1238,90 +1250,106 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 	}
 }
 
-func (p *PubSub) handleIncomingRPC(rpc *RPC) {
+func (p *PubSub) handleIncomingRPCs(rpcs []*RPC) {
 	// pass the rpc through app specific validation (if any available).
 	if p.appSpecificRpcInspector != nil {
-		// check if the RPC is allowed by the external inspector
-		if err := p.appSpecificRpcInspector(rpc.from, rpc); err != nil {
-			log.Debugf("application-specific inspection failed, rejecting incoming rpc: %s", err)
-			return // reject the RPC
-		}
-	}
+		filteredRpcs := []*RPC{}
 
-	p.tracer.RecvRPC(rpc)
-
-	subs := rpc.GetSubscriptions()
-	if len(subs) != 0 && p.subFilter != nil {
-		var err error
-		subs, err = p.subFilter.FilterIncomingSubscriptions(rpc.from, subs)
-		if err != nil {
-			log.Debugf("subscription filter error: %s; ignoring RPC", err)
-			return
-		}
-	}
-
-	for _, subopt := range subs {
-		t := subopt.GetTopicid()
-
-		if subopt.GetSubscribe() {
-			tmap, ok := p.topics[t]
-			if !ok {
-				tmap = make(map[peer.ID]struct{})
-				p.topics[t] = tmap
+		for _, rpc := range rpcs {
+			// check if the RPC is allowed by the external inspector
+			if err := p.appSpecificRpcInspector(rpc.from, rpc); err != nil {
+				log.Debugf("application-specific inspection failed, rejecting incoming rpc: %s", err)
+				continue
 			}
+			filteredRpcs = append(filteredRpcs, rpc)
+		}
+		rpcs = filteredRpcs
+	}
+	if len(rpcs) == 0 {
+		return
+	}
 
-			if _, ok = tmap[rpc.from]; !ok {
-				tmap[rpc.from] = struct{}{}
-				if topic, ok := p.myTopics[t]; ok {
-					peer := rpc.from
-					topic.sendNotification(PeerEvent{PeerJoin, peer})
+	for _, rpc := range rpcs {
+		p.tracer.RecvRPC(rpc)
+
+		subs := rpc.GetSubscriptions()
+		if len(subs) != 0 && p.subFilter != nil {
+			var err error
+			subs, err = p.subFilter.FilterIncomingSubscriptions(rpc.from, subs)
+			if err != nil {
+				log.Debugf("subscription filter error: %s; ignoring RPC", err)
+				continue
+			}
+		}
+
+		for _, subopt := range subs {
+			t := subopt.GetTopicid()
+
+			if subopt.GetSubscribe() {
+				tmap, ok := p.topics[t]
+				if !ok {
+					tmap = make(map[peer.ID]struct{})
+					p.topics[t] = tmap
+				}
+
+				if _, ok = tmap[rpc.from]; !ok {
+					tmap[rpc.from] = struct{}{}
+					if topic, ok := p.myTopics[t]; ok {
+						peer := rpc.from
+						topic.sendNotification(PeerEvent{PeerJoin, peer})
+					}
+				}
+			} else {
+				tmap, ok := p.topics[t]
+				if !ok {
+					continue
+				}
+
+				if _, ok := tmap[rpc.from]; ok {
+					delete(tmap, rpc.from)
+					p.notifyLeave(t, rpc.from)
 				}
 			}
-		} else {
-			tmap, ok := p.topics[t]
-			if !ok {
-				continue
-			}
-
-			if _, ok := tmap[rpc.from]; ok {
-				delete(tmap, rpc.from)
-				p.notifyLeave(t, rpc.from)
-			}
 		}
 	}
 
-	// ask the router to vet the peer before commiting any processing resources
-	switch p.rt.AcceptFrom(rpc.from) {
-	case AcceptNone:
-		log.Debugf("received RPC from router graylisted peer %s; dropping RPC", rpc.from)
-		return
+	var toPush []*Message
+	var toProcess []*RPC
+	for _, rpc := range rpcs {
+		// ask the router to vet the peer before commiting any processing resources
+		switch p.rt.AcceptFrom(rpc.from) {
+		case AcceptNone:
+			log.Debugf("received RPC from router graylisted peer %s; dropping RPC", rpc.from)
+			continue
 
-	case AcceptControl:
-		if len(rpc.GetPublish()) > 0 {
-			log.Debugf("peer %s was throttled by router; ignoring %d payload messages", rpc.from, len(rpc.GetPublish()))
-		}
-		p.tracer.ThrottlePeer(rpc.from)
-
-	case AcceptAll:
-		var toPush []*Message
-		for _, pmsg := range rpc.GetPublish() {
-			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
-				log.Debug("received message in topic we didn't subscribe to; ignoring message")
-				continue
+		case AcceptControl:
+			if len(rpc.GetPublish()) > 0 {
+				log.Debugf("peer %s was throttled by router; ignoring %d payload messages", rpc.from, len(rpc.GetPublish()))
 			}
+			p.tracer.ThrottlePeer(rpc.from)
 
-			msg := &Message{pmsg, "", rpc.from, nil, false}
-			if p.shouldPush(msg) {
-				toPush = append(toPush, msg)
+		case AcceptAll:
+			var msgs []*Message
+			for _, pmsg := range rpc.GetPublish() {
+				if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
+					log.Debug("received message in topic we didn't subscribe to; ignoring message")
+					continue
+				}
+
+				msg := &Message{pmsg, "", rpc.from, nil, false}
+				if p.shouldPush(msg) {
+					msgs = append(msgs, msg)
+					toPush = append(toPush, msg)
+				}
 			}
+			p.rt.Preprocess(rpc.from, msgs)
 		}
-		p.rt.Preprocess(rpc.from, toPush)
-		for _, msg := range toPush {
-			p.pushMsg(msg)
-		}
+		toProcess = append(toProcess, rpc)
 	}
-
-	p.rt.HandleRPC(rpc)
+	p.pushMsgs(toPush)
+	for _, rpc := range toProcess {
+		p.rt.HandleRPC(rpc)
+	}
 }
 
 // DefaultMsgIdFn returns a unique ID of the passed Message
@@ -1377,16 +1405,19 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 }
 
 // pushMsg pushes a message performing validation as necessary
-func (p *PubSub) pushMsg(msg *Message) {
-	src := msg.ReceivedFrom
-	id := p.idGen.ID(msg)
+func (p *PubSub) pushMsgs(msgs []*Message) {
+	// The returned list is the list of messages that can be published immediately
+	syncMsgs := p.val.Push(msgs)
 
-	if !p.val.Push(src, msg) {
-		return
+	var toPublish []*Message
+	for _, msg := range syncMsgs {
+		id := p.idGen.ID(msg)
+		if p.markSeen(id) {
+			toPublish = append(toPublish, msg)
+		}
 	}
-
-	if p.markSeen(id) {
-		p.publishMessage(msg)
+	if len(toPublish) > 0 {
+		p.publishMessages(toPublish)
 	}
 }
 
@@ -1422,12 +1453,16 @@ func (p *PubSub) checkSigningPolicy(msg *Message) error {
 	return nil
 }
 
-func (p *PubSub) publishMessage(msg *Message) {
-	p.tracer.DeliverMessage(msg)
-	p.notifySubs(msg)
-	if !msg.Local {
-		p.rt.Publish(msg)
+func (p *PubSub) publishMessages(msgs []*Message) {
+	var toPublish []*Message
+	for _, msg := range msgs {
+		p.tracer.DeliverMessage(msg)
+		p.notifySubs(msg)
+		if !msg.Local {
+			toPublish = append(toPublish, msg)
+		}
 	}
+	p.rt.Publish(toPublish)
 }
 
 func (p *PubSub) publishMessageBatch(batchAndOpts messageBatchAndPublishOptions) {

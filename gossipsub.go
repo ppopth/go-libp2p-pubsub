@@ -1173,7 +1173,7 @@ func (gs *GossipSubRouter) PublishBatch(messages []*Message, opts *BatchPublishO
 	strategy := opts.Strategy
 	for _, msg := range messages {
 		msgID := gs.p.idGen.ID(msg)
-		for p, rpc := range gs.rpcs(msg) {
+		for p, rpc := range gs.rpcs([]*Message{msg}) {
 			strategy.AddRPC(p, msgID, rpc)
 		}
 	}
@@ -1183,47 +1183,94 @@ func (gs *GossipSubRouter) PublishBatch(messages []*Message, opts *BatchPublishO
 	}
 }
 
-func (gs *GossipSubRouter) Publish(msg *Message) {
-	for p, rpc := range gs.rpcs(msg) {
+func (gs *GossipSubRouter) Publish(msgs []*Message) {
+	for p, rpc := range gs.rpcs(msgs) {
 		gs.sendRPC(p, rpc, false)
 	}
 }
 
-func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
+func (gs *GossipSubRouter) rpcs(messages []*Message) iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
-		gs.mcache.Put(msg)
-
-		from := msg.ReceivedFrom
-		topic := msg.GetTopic()
-
-		tosend := make(map[peer.ID]struct{})
-
-		// any peers in the topic?
-		tmap, ok := gs.p.topics[topic]
-		if !ok {
-			return
+		for _, msg := range messages {
+			gs.mcache.Put(msg)
 		}
 
-		if gs.floodPublish && from == gs.p.host.ID() {
-			for p := range tmap {
-				_, direct := gs.direct[p]
-				if direct || gs.score.Score(p) >= gs.publishThreshold {
-					tosend[p] = struct{}{}
+		tosend := make(map[peer.ID]map[*Message]struct{})
+
+		appendTosend := func(p peer.ID, msgs ...*Message) {
+			if tosend[p] == nil {
+				tosend[p] = make(map[*Message]struct{})
+			}
+			for _, msg := range msgs {
+				tosend[p][msg] = struct{}{}
+			}
+		}
+
+		// mapping from topics to a list of locally published messages
+		localMsgMap := make(map[string][]*Message)
+		// mapping from topics to a list of messages supposed to be sent to mesh peers
+		meshMsgMap := make(map[string][]*Message)
+
+		for _, msg := range messages {
+			topic := msg.GetTopic()
+			if msg.ReceivedFrom == gs.p.host.ID() {
+				// save locally published messages
+				localMsgMap[topic] = append(localMsgMap[topic], msg)
+			} else {
+				// non-local messages are supposed to be sent to mesh peers
+				meshMsgMap[topic] = append(meshMsgMap[topic], msg)
+			}
+		}
+
+		if gs.floodPublish {
+			for topic, msgs := range localMsgMap {
+				// any peers in the topic?
+				tmap, ok := gs.p.topics[topic]
+				if !ok {
+					continue
+				}
+				// no need to send if there is no message
+				if len(msgs) == 0 {
+					continue
+				}
+
+				for p := range tmap {
+					_, direct := gs.direct[p]
+					if direct || gs.score.Score(p) >= gs.publishThreshold {
+						appendTosend(p, msgs...)
+					}
 				}
 			}
 		} else {
+			// if flood publish is not enabled, send locally published messages to mesh peers
+			for topic, msgs := range localMsgMap {
+				meshMsgMap[topic] = append(meshMsgMap[topic], msgs...)
+			}
+		}
+
+		for topic, msgs := range meshMsgMap {
+			// any peers in the topic?
+			tmap, ok := gs.p.topics[topic]
+			if !ok {
+				continue
+			}
+			// no need to send if there is no message
+			if len(msgs) == 0 {
+				continue
+			}
+
 			// direct peers
 			for p := range gs.direct {
 				_, inTopic := tmap[p]
 				if inTopic {
-					tosend[p] = struct{}{}
+					appendTosend(p, msgs...)
 				}
 			}
 
 			// floodsub peers
 			for p := range tmap {
 				if !gs.feature(GossipSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.publishThreshold {
-					tosend[p] = struct{}{}
+					appendTosend(p, msgs...)
 				}
 			}
 
@@ -1247,25 +1294,31 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 				gs.lastpub[topic] = time.Now().UnixNano()
 			}
 
-			csum := computeChecksum(gs.p.idGen.ID(msg))
-			for p := range gmap {
-				// Check if it has already received an IDONTWANT for the message.
-				// If so, don't send it to the peer
-				if _, ok := gs.unwanted[p][csum]; ok {
-					continue
+			for _, msg := range msgs {
+				csum := computeChecksum(gs.p.idGen.ID(msg))
+				for p := range gmap {
+					// Check if it has already received an IDONTWANT for the message.
+					// If so, don't send it to the peer
+					if _, ok := gs.unwanted[p][csum]; ok {
+						continue
+					}
+					appendTosend(p, msg)
 				}
-				tosend[p] = struct{}{}
 			}
 		}
 
-		out := rpcWithMessages(msg.Message)
-		for pid := range tosend {
-			if pid == from || pid == peer.ID(msg.GetFrom()) {
-				continue
+		for pid, mmap := range tosend {
+			var msgs []*pb.Message
+			for msg := range mmap {
+				if pid == msg.ReceivedFrom || pid == peer.ID(msg.GetFrom()) {
+					continue
+				}
+				msgs = append(msgs, msg.Message)
 			}
 
-			if !yield(pid, out) {
-				return
+			if len(msgs) > 0 {
+				out := rpcWithMessages(msgs...)
+				yield(pid, out)
 			}
 		}
 	}
